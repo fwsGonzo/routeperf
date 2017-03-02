@@ -5,8 +5,7 @@ import os
 import subprocess
 import thread
 
-includeos_src = os.environ.get('INCLUDEOS_SRC',
-                               os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__))).split('/test')[0])
+includeos_src = "/home/gonzo/github/IncludeOS"
 print 'includeos_src: {0}'.format(includeos_src)
 sys.path.insert(0,includeos_src)
 
@@ -27,7 +26,7 @@ def move_tap1(o):
     print "Moving",if2, "to", br2
     subprocess.call(["sudo", "brctl", "delif", br1, if2])
     subprocess.call(["sudo", "brctl", "addif", br2, if2])
-    subprocess.call(["sudo", "ifconfig", if2, "up"])
+    #subprocess.call(["sudo", "ifconfig", if2, "up"])
 
 
 def clean():

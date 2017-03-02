@@ -19,17 +19,95 @@
 // #define NO_INFO
 
 #include <os>
-#include <kernel/irq_manager.hpp>
-#include <list>
 #include <net/inet4>
 #include <net/router.hpp>
 #include <timers>
-#include <profile>
-
-#define USE_STACK_SAMPLING
 
 using namespace net;
 using namespace std::chrono;
+static void init_routing_table();
+
+#include <smp>
+#include <kernel/irq_manager.hpp>
+
+struct alignas(128) packet_handoff
+{
+  std::deque<Packet_ptr>  queue;
+  std::vector<Packet_ptr> shipit;
+  Inet<IP4>*   inet_stack;
+  uint8_t      bcast_irq;
+  spinlock_t   qlock;
+};
+static std::array<packet_handoff, SMP_MAX_CORES> handoff;
+// ready counter for routing CPUs
+static int vcpus_ready = 0;
+
+static void vcpu_irq_handler()
+{
+  auto& temp  = PER_CPU(handoff).shipit;
+  auto& queue = PER_CPU(handoff).queue;
+
+  lock(PER_CPU(handoff).qlock);
+  {
+    // read all packets from queue to temp
+    while (!queue.empty())
+    {
+      temp.push_back(std::move(queue.front()));
+      queue.pop_front();
+    }
+  }
+  unlock(PER_CPU(handoff).qlock);
+
+  // ship all packets from temp to inet stack
+  auto* stack = PER_CPU(handoff).inet_stack;
+  for (auto& packet : temp)
+      stack->ip_obj().ship(std::move(packet));
+  temp.clear();
+}
+
+void vcpu_init_handoff(Inet<IP4>& stack)
+{
+  // set broadcast IRQ
+  auto& bcast_irq = PER_CPU(handoff).bcast_irq;
+  bcast_irq = IRQ_manager::get().get_free_irq();
+  SMP::global_lock();
+  INFO("Router", "CPU %u  Broadcast on IRQ %u", 
+        SMP::cpu_id(), PER_CPU(handoff).bcast_irq);
+  SMP::global_unlock();
+  // set IRQ handler
+  IRQ_manager::get().subscribe(bcast_irq, vcpu_irq_handler);
+  // set inet stack and cpuid lookup entry
+  PER_CPU(handoff).inet_stack = &stack;
+}
+void vcpu_signal_ready()
+{
+  SMP::global_lock();
+  auto* inet = PER_CPU(handoff).inet_stack;
+  if (inet)
+    INFO("Router", "CPU %u  IP: %s", 
+          SMP::cpu_id(), inet->ip_addr().str().c_str());
+  
+  vcpus_ready++;
+  if (vcpus_ready == 2) {
+    INFO("Router", "All CPUs are ready");
+    init_routing_table();
+  }
+  SMP::global_unlock();
+}
+
+static void smp_ship(Inet<IP4>* stack, Packet_ptr packet)
+{
+  int cpu = stack->get_cpu_id();
+  
+  auto& hoff = handoff[cpu];
+  lock(hoff.qlock);
+  {
+    hoff.queue.push_back(std::move(packet));
+  }
+  unlock(hoff.qlock);
+  // defer this?
+  vcpu_irq_handler();
+}
 
 std::unique_ptr<Router<IP4> > router;
 
@@ -48,11 +126,10 @@ bool route_checker(IP4::addr addr) {
   return have_route;
 }
 
-void ip_forward (Inet<IP4>& stack,  IP4::IP_packet_ptr pckt) {
+void ip_forward (Inet<IP4>& stack, IP4::IP_packet_ptr pckt) {
 
   // Packet could have been erroneously moved prior to this call
-  if (not pckt)
-    return;
+  if (not pckt) return;
 
   Inet<IP4>* route = router->get_first_interface(pckt->dst());
 
@@ -60,42 +137,58 @@ void ip_forward (Inet<IP4>& stack,  IP4::IP_packet_ptr pckt) {
     INFO("ip_fwd", "No route found for %s dropping\n", pckt->dst().to_string().c_str());
     return;
   }
-
-  if (route == &stack) {
+  else if (route == &stack) {
     INFO("ip_fwd", "* Oh, this packet was for me, sow why was it forwarded here? \n");
     return;
   }
-
-  debug("ip_fwd %s transmitting packet to %s", ifname, route->ifname().c_str());
-  route->ip_obj().ship(std::move(pckt));
+  else {
+    debug("ip_fwd %s transmitting packet to %s", ifname, route->ifname().c_str());
+    if (SMP::cpu_id() == route->get_cpu_id())
+        route->ip_obj().ship(std::move(pckt));
+    else
+        smp_ship(route, std::move(pckt));
+  }
 }
 
+void Service::start() {}
 
-void Service::start(const std::string&)
+void Service::ready()
 {
-  auto& inet = Inet4::stack<0>();
-  inet.network_config({  10,  0,  0, 42 },   // IP
-                      { 255, 255, 0,  0 },   // Netmask
-                      {  10,  0,  0,  1 } ); // Gateway
+  if (SMP::cpu_id() == 0)
+  {
+SMP::global_lock();
+    auto& inet = Inet4::stack<0>();
+    inet.network_config({  10,  0,  0, 42 },   // IP
+                        { 255, 255, 0,  0 },   // Netmask
+                        {  10,  0,  0,  1 });  // Gateway
+SMP::global_unlock();
+    vcpu_init_handoff(inet);
+  }
+  if (SMP::cpu_id() == 0)
+  {
+SMP::global_lock();
+    auto& inet = Inet4::stack<1>();
+    inet.network_config({  10,  42,  42, 43 },  // IP
+                        { 255, 255, 255,  0 },  // Netmask
+                        {  10,  42,  42,  2 }); // Gateway
+SMP::global_unlock();
+    vcpu_init_handoff(inet);
+  }
+  vcpu_signal_ready();
+}
 
-  INFO("Router","Interface 1 IP: %s\n", inet.ip_addr().str().c_str());
-
+void init_routing_table()
+{
+  auto& inet1 = Inet4::stack<0>();
   auto& inet2 = Inet4::stack<1>();
-  inet2.network_config({  10,  42,  42, 43 },   // IP
-                      { 255, 255, 255,  0 },   // Netmask
-                      {  10,  42,  42,  2 } ); // Gateway
-
-  INFO("Router","Interface2 IP: %s\n", inet2.ip_addr().str().c_str());
-
 
   // IP Forwarding
-  inet.ip_obj().set_packet_forwarding(ip_forward);
+  inet1.ip_obj().set_packet_forwarding(ip_forward);
   inet2.ip_obj().set_packet_forwarding(ip_forward);
 
   // ARP Route checker
-  inet.set_route_checker(route_checker);
+  inet1.set_route_checker(route_checker);
   inet2.set_route_checker(route_checker);
-
 
   /** Some times it's nice to add dest. to arp-cache to avoid having it respond to arp */
   // inet2.cache_link_ip({10,42,42,2}, {0x10,0x11, 0x12, 0x13, 0x14, 0x15});
@@ -104,8 +197,8 @@ void Service::start(const std::string&)
 
   // Routing table
   Router<IP4>::Routing_table routing_table{
-    {{10, 42, 42, 0 }, { 255, 255, 255, 0}, {10, 42, 42, 2}, inet2 , 1 },
-    {{10, 0, 0, 0 }, { 255, 255, 255, 0}, {10, 0, 0, 1}, inet , 1 }
+    {{10, 42, 42, 0 }, { 255, 255, 255, 0}, {10, 42, 42, 2}, inet2, 1 },
+    {{10,  0,  0, 0 }, { 255, 255, 255, 0}, {10,  0,  0, 1}, inet1, 1 }
   };
 
   router = std::make_unique<Router<IP4>>(Super_stack::inet().ip4_stacks(), routing_table);
@@ -119,5 +212,4 @@ void Service::start(const std::string&)
           r.gateway().str().c_str(),
           r.cost());
   printf("\n");
-  INFO("Router","Service ready");
 }
