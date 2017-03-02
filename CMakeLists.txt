@@ -12,8 +12,12 @@ project (test_udp)
 set(SERVICE_NAME "Routing test service")
 set(BINARY       "test_router")
 set(MAX_MEM 128)
-set(SOURCES service.cpp)
-set(DRIVERS virtionet) #vmxnet3
+set(SOURCES service.cpp smp_ship.cpp)
+
+set(DRIVERS 
+    virtionet
+    #vmxnet3
+    silent_start)
 
 # include service build script
 include($ENV{INCLUDEOS_PREFIX}/includeos/service.cmake)
