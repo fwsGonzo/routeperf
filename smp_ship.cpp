@@ -54,17 +54,17 @@ void vcpu_init_handoff(Inet<IP4>& stack)
   // set inet stack and cpuid lookup entry
   PER_CPU(handoff).inet_stack = &stack;
 }
-void vcpu_signal_ready()
+void vcpu_signal_ready(int max)
 {
   SMP::global_lock();
   auto* inet = PER_CPU(handoff).inet_stack;
-  if (inet == nullptr) return;
-
-  INFO("Router", "CPU %u  IP: %s", 
-        SMP::cpu_id(), inet->ip_addr().str().c_str());
+  if (inet) {
+    INFO("Router", "CPU %u  IP: %s", 
+          SMP::cpu_id(), inet->ip_addr().str().c_str());
+  }
 
   vcpus_ready++;
-  if (vcpus_ready == 2)
+  if (vcpus_ready == max)
   {
     INFO("Router", "All CPUs are ready");
     extern void init_routing_table();

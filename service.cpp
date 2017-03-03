@@ -26,7 +26,7 @@ using namespace net;
 
 extern void smp_ship(Inet<IP4>*, Packet_ptr);
 extern void vcpu_init_handoff(Inet<IP4>&);
-extern void vcpu_signal_ready();
+extern void vcpu_signal_ready(int);
 
 void Service::start() {}
 
@@ -52,7 +52,7 @@ SMP::global_lock();
 SMP::global_unlock();
     vcpu_init_handoff(inet);
   }
-  vcpu_signal_ready();
+  vcpu_signal_ready(2);
 }
 
 
@@ -72,16 +72,20 @@ bool route_checker(IP4::addr addr)
 void ip_forward (Inet<IP4>& stack, IP4::IP_packet_ptr pckt)
 {
   // Packet could have been erroneously moved prior to this call
-  if (not pckt) return;
+  assert(pckt);
 
   Inet<IP4>* route = router->get_first_interface(pckt->dst());
 
   if (not route){
+SMP::global_lock();
     INFO("ip_fwd", "No route found for %s dropping\n", pckt->dst().to_string().c_str());
+SMP::global_unlock();
     return;
   }
   else if (route == &stack) {
+SMP::global_lock();
     INFO("ip_fwd", "* Oh, this packet was for me, sow why was it forwarded here? \n");
+SMP::global_unlock();
     return;
   }
   else {
