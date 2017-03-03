@@ -6,18 +6,17 @@
 #include <smp>
 #include <net/inet4>
 #include <kernel/irq_manager.hpp>
-#include <deque>
 #include <vector>
 
 using namespace net;
 
 struct alignas(128) packet_handoff
 {
-  std::deque<Packet_ptr>  queue;
-  std::vector<Packet_ptr> shipit;
+  int current_queue = 0;
   Inet<IP4>*   inet_stack;
   uint8_t      bcast_irq;
   spinlock_t   qlock;
+  alignas(64) std::vector<Packet_ptr> queue[2];
 };
 static std::array<packet_handoff, SMP_MAX_CORES> handoff;
 // ready counter for routing CPUs
@@ -25,26 +24,20 @@ static int vcpus_ready = 0;
 
 static void vcpu_irq_handler()
 {
-  auto& temp  = PER_CPU(handoff).shipit;
-  auto& queue = PER_CPU(handoff).queue;
-
   lock(PER_CPU(handoff).qlock);
   {
-    // read all packets from queue to temp
-    while (!queue.empty())
-    {
-      temp.push_back(std::move(queue.front()));
-      queue.pop_front();
-    }
+    // swich queue
+    PER_CPU(handoff).current_queue = 1 - PER_CPU(handoff).current_queue;
   }
   unlock(PER_CPU(handoff).qlock);
 
   // ship all packets from temp to inet stack
   auto* stack = PER_CPU(handoff).inet_stack;
-  for (auto& packet : temp) {
+  auto& queue = PER_CPU(handoff).queue[1 - PER_CPU(handoff).current_queue];
+  for (auto& packet : queue) {
     stack->ip_obj().ship(std::move(packet));
   }
-  temp.clear();
+  queue.clear();
 }
 
 void vcpu_init_handoff(Inet<IP4>& stack)
@@ -65,10 +58,11 @@ void vcpu_signal_ready()
 {
   SMP::global_lock();
   auto* inet = PER_CPU(handoff).inet_stack;
-  if (inet)
-    INFO("Router", "CPU %u  IP: %s", 
-          SMP::cpu_id(), inet->ip_addr().str().c_str());
-  
+  if (inet == nullptr) return;
+
+  INFO("Router", "CPU %u  IP: %s", 
+        SMP::cpu_id(), inet->ip_addr().str().c_str());
+
   vcpus_ready++;
   if (vcpus_ready == 2)
   {
@@ -86,7 +80,7 @@ void smp_ship(Inet<IP4>* stack, Packet_ptr packet)
   auto& hoff = handoff[cpu];
   lock(hoff.qlock);
   {
-    hoff.queue.push_back(std::move(packet));
+    hoff.queue[hoff.current_queue].push_back(std::move(packet));
   }
   unlock(hoff.qlock);
   // defer this?
